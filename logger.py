@@ -1,9 +1,11 @@
 import argparse
+import datetime
 import json
 import os
+import serial
 import signal
 import sys
-import serial
+
 
 jsonFormatName = "StructuredFormat"
 jsonEoDName = "EndofData"
@@ -42,7 +44,7 @@ def loadJson(json_path):
                 raise KeyError("Missing Structured Format or End of Data keys from JSON file.")
             EoDMarker = config[jsonEoDName]
             structureFormat = config[jsonFormatName]
-            return Tuple(structureFormat,EoDMarker)
+            return [structureFormat,EoDMarker]
         except (json.JSONDecodeError, KeyError) as e:
             print(f"[Error] Failed to parse JSON config: {e}")
             sys.exit(1)
@@ -94,7 +96,7 @@ def main():
     try:
         # timeout=1 ensures the read loop doesn't block indefinitely, allowing signal handling
         ser = serial.Serial(args.serialPort, args.baudRate, timeout=1)
-    except serial.SerialException as e:
+    except Exception as e:
         print(f"[Error] Could not open serial port: {e}")
         sys.exit(1)
 
