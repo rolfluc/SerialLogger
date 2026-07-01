@@ -2,134 +2,141 @@ import argparse
 import datetime
 import json
 import os
-import serial
 import signal
 import sys
+import time
+import re
+import serial
 
-
-jsonFormatName = "StructuredFormat"
-jsonEoDName = "EndofData"
-# Global list to store collected data blocks
-collected_data = []
+# Global structures for continuous capture
+raw_stream = ""
 collected_timestamps = []
-current_block = ""
 
-def parseArgs():
+# High-resolution baseline reference time
+BASE_WALL_TIME = datetime.datetime.now()
+BASE_PERF_COUNTER = time.perf_counter()
+
+def get_high_res_timestamp():
+    """Calculates a high-precision timestamp using time.perf_counter() offsets."""
+    elapsed_seconds = time.perf_counter() - BASE_PERF_COUNTER
+    precise_time = BASE_WALL_TIME + datetime.timedelta(seconds=elapsed_seconds)
+    return precise_time.strftime('%Y-%m-%d %H:%M:%S.%f')
+
+def parse_arguments():
     """Handles CLI arguments."""
     parser = argparse.ArgumentParser(
-        description="Cross-platform Serial Port Reader and JSON-based Structurer."
+        description="High-Precision Continuous Buffer Serial Reader."
     )
-    parser.add_argument("-si", "--structuredIn", required=True, 
-                        help="Path to the configuration .json file")
-    parser.add_argument("-fo", "--fileOut", required=True, 
-                        help="Path to the output .csv file")
-    parser.add_argument("-sp", "--serialPort", required=True, 
-                        help="Serial port name (e.g., COM3 or /dev/ttyUSB0)")
-    parser.add_argument("-br", "--baudRate", type=int, default=115200, 
-                        help="Baud rate for the serial port (default: 115200)")
+    parser.add_argument("-si", "--structuredIn", required=True, help="Path to configuration .json")
+    parser.add_argument("-fo", "--fileOut", required=True, help="Path to output .csv")
+    parser.add_argument("-sp", "--serialPort", required=True, help="Serial port (e.g. COM3 or /dev/ttyUSB0)")
+    parser.add_argument("-br", "--baudRate", type=int, default=9600, help="Baud rate")
     return parser.parse_args()
 
-def loadJson(json_path):
-    global jsonFormatName, jsonEoDName
+def load_config(json_path):
     """Loads and validates the JSON configuration."""
     if not os.path.exists(json_path):
         print(f"[Error] Configuration file not found at: {json_path}")
         sys.exit(1)
-        
     with open(json_path, 'r') as f:
         try:
             config = json.load(f)
-            # Ensure required keys exist
-            if jsonFormatName not in config or jsonEoDName not in config:
-                raise KeyError("Missing Structured Format or End of Data keys from JSON file.")
-            EoDMarker = config[jsonEoDName]
-            structureFormat = config[jsonFormatName]
-            return [structureFormat,EoDMarker]
+            if "Structured Format" not in config or "End of Data" not in config:
+                raise KeyError("Missing 'Structured Format' or 'End of Data' keys.")
+            return config
         except (json.JSONDecodeError, KeyError) as e:
             print(f"[Error] Failed to parse JSON config: {e}")
             sys.exit(1)
 
 def apply_structure(raw_data, format_str):
     """
-    Formats the raw string by inserting commas based on the format structure.
-    Example: 'ABCDEF12' with format 'XXXX' becomes 'ABCD,EF12'
+    Strips out all whitespaces, carriage returns, and non-alphanumeric noise,
+    then segments the clean data into strict chunks separated by commas.
     """
-    # Clean the data of any accidental residual newlines/whitespace
-    clean_data = raw_data.strip()
-    chunk_size = len(format_str)
+    # Isolate only valid characters (removes hidden \r, spaces, etc.)
+    clean_data = re.sub(r'[^a-zA-Z0-9]', '', raw_data)
     
-    if chunk_size == 0:
+    chunk_size = len(format_str)
+    if chunk_size == 0 or not clean_data:
         return clean_data
-
-    # Split the string into chunks of 'chunk_size'
+        
     chunks = [clean_data[i:i+chunk_size] for i in range(0, len(clean_data), chunk_size)]
     return ",".join(chunks)
 
-def save_to_csv(data_list, format_str, output_path):
-    """Processes all accumulated data blocks and writes them to a CSV."""
-    print(f"\n[Info] Referencing captured data against structure format '{format_str}'...")
+def process_and_save(stream_data, timestamps, marker, format_str, output_path):
+    """Cleans stream boundaries, handles the 1:1 pop optimization, and writes to CSV."""
+    print("\n[Info] Parsing raw data stream boundaries...")
+
+    first_marker_idx = stream_data.find(marker)
+    last_marker_idx = stream_data.rfind(marker)
+
+    if first_marker_idx == -1 or first_marker_idx == last_marker_idx:
+        print("[Warning] Insufficient data segments recorded. CSV was not generated.")
+        return
+
+    # Isolate data string starting right after the first marker up to the last marker
+    clean_stream = stream_data[first_marker_idx + len(marker) : last_marker_idx]
     
-    formatted_rows = []
-    for block in data_list:
-        if block.strip(): # Skip empty blocks
-            formatted_row = apply_structure(block, format_str)
-            formatted_rows.append(formatted_row)
+    # Intentionally pop the first timestamp off to match the dropped leading fragment
+    if timestamps:
+        popped_ts = timestamps.pop(0)
+        print(f"[Cleanup] Dropped initial incomplete block data and timestamp: {popped_ts}")
+
+    # Split remaining stream into individual structural blocks
+    raw_blocks = clean_stream.split(marker)
+    
+    # Filter empty items that might appear from double-markers
+    data_blocks = [b for b in raw_blocks if b.strip()]
+
+    print(f"[Info] Sync Check -> Clean Blocks: {len(data_blocks)} | Timestamps Tracked: {len(timestamps)}")
 
     try:
         with open(output_path, 'w', newline='') as csv_file:
-            for row in formatted_rows:
-                csv_file.write(row + "\n")
-        print(f"[Success] Data successfully flushed to {output_path}")
+            # Zip ensures alignment matching data blocks strictly against remaining timestamps
+            for block, ts in zip(data_blocks, timestamps):
+                formatted_row = apply_structure(block, format_str)
+                if formatted_row:
+                    csv_file.write(f"{ts},{formatted_row}\n")
+        print(f"[Success] Stream finalized and flushed to {output_path}")
     except Exception as e:
         print(f"[Error] Failed to write to CSV file: {e}")
 
 def main():
-    global current_block, collected_data
-    args = parseArgs()
-    config = loadJson(args.structuredIn)
+    global raw_stream, collected_timestamps
+    args = parse_arguments()
+    config = load_config(args.structuredIn)
     
-    structure_format = config[0]
-    end_of_data_marker = config[1]
+    end_of_data_marker = config["End of Data"]
+    structure_format = config["Structured Format"]
 
-    # Attempt to open the serial port
     print(f"[Info] Attempting to open serial port {args.serialPort} at {args.baudRate} baud...")
     try:
-        # timeout=1 ensures the read loop doesn't block indefinitely, allowing signal handling
-        ser = serial.Serial(args.serialPort, args.baudRate, timeout=1)
-    except Exception as e:
+        ser = serial.Serial(args.serialPort, args.baudRate, timeout=0.01)
+    except serial.SerialException as e:
         print(f"[Error] Could not open serial port: {e}")
         sys.exit(1)
 
-    print(f"[Connected] Listening in real-time. Press Ctrl+C to stop and save data.")
+    print(f"[Connected] Stream recording active. Press Ctrl+C to terminate.")
 
-    # Signal handler for graceful Ctrl+C shutdown
     def signal_handler(sig, frame):
-        print("\n[Ctrl+C Detected] Closing serial port and finalizing data...")
+        print("\n[Ctrl+C Detected] Halting hardware port interface...")
         ser.close()
-        save_to_csv(collected_data, structure_format, args.fileOut)
+        process_and_save(raw_stream, collected_timestamps, end_of_data_marker, structure_format, args.fileOut)
         sys.exit(0)
 
-    # Register the Ctrl+C listener
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Real-time listening loop
     while True:
         try:
-            # Read data byte by byte
             byte_data = ser.read(1)
             if byte_data:
-                # Decode character (ignoring errors if non-text noise appears on lines)
                 char = byte_data.decode('utf-8', errors='ignore')
-                current_block += char
+                raw_stream += char
 
-                # Check if the end of data sequence has been met
-                if current_block.endswith(end_of_data_marker):
-                    # Strip the marker off the data block before appending
-                    data_to_append = current_block[:-len(end_of_data_marker)]
-                    print(f"[Data Block Captured] : {data_to_append.strip()}")
-                    collected_data.append(data_to_append)
-                    collected_timestamps.append(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'))
-                    current_block = "" # Reset for next block
+                # Check back across continuous string for the end marker 
+                if raw_stream.endswith(end_of_data_marker):
+                    timestamp = get_high_res_timestamp()
+                    collected_timestamps.append(timestamp)
                     
         except serial.SerialException as e:
             print(f"\n[Error] Serial port error during read: {e}")
